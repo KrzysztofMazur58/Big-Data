@@ -1,11 +1,40 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import shutil
+import threading
 import time
 from pathlib import Path, PurePosixPath
 import zipfile
 import requests
 from .settings import ARCHIVE, CSV_DIR, DATA, MIN_BYTES, SOURCE_URL
+
+DOWNLOAD_WORKERS = 8
+PART_SIZE = 32 * 1024 * 1024
+
+
+def _download_range(url, etag, target_path, start, end, progress_cb):
+    headers = {"Range": f"bytes={start}-{end}", "If-Range": etag}
+    for attempt in range(1, 7):
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=(30, 90)) as response:
+                response.raise_for_status()
+                if response.status_code != 206:
+                    raise RuntimeError("Serwer nie obsługuje równoległego pobierania (Range).")
+                pos = start
+                with target_path.open("r+b") as target:
+                    target.seek(start)
+                    for chunk in response.iter_content(2 * 1024 * 1024):
+                        target.write(chunk)
+                        pos += len(chunk)
+                        progress_cb(len(chunk))
+                if pos != end + 1:
+                    raise requests.ConnectionError("Niepełny fragment archiwum")
+                return
+        except requests.RequestException:
+            if attempt == 6:
+                raise
+            time.sleep(min(attempt * 2, 10))
 
 
 def download():
@@ -28,35 +57,68 @@ def download():
         info_path.write_text(json.dumps({"url": SOURCE_URL, "etag": etag, "bytes": expected}, indent=2), encoding="utf-8")
         if shutil.disk_usage(DATA).free < max(expected - (partial.stat().st_size if partial.exists() else 0), 0) + 2_000_000_000:
             raise RuntimeError("Za mało wolnego miejsca na dysku.")
-        for attempt in range(1, 7):
-            offset = partial.stat().st_size if partial.exists() else 0
-            if offset == expected:
-                break
-            if offset > expected:
-                raise RuntimeError("Plik .part jest większy niż archiwum docelowe.")
-            headers = {"Range": f"bytes={offset}-", "If-Range": etag} if offset else {}
+
+        if not partial.exists() and expected >= PART_SIZE * 2:
+            with partial.open("wb") as target:
+                target.truncate(expected)
+            ranges = [
+                (start, min(start + PART_SIZE - 1, expected - 1))
+                for start in range(0, expected, PART_SIZE)
+            ]
+            done = 0
+            last = time.monotonic()
+            lock = threading.Lock()
+
+            def on_chunk(size):
+                nonlocal done, last
+                with lock:
+                    done += size
+                    now = time.monotonic()
+                    if now - last > 5:
+                        print(f"Pobieranie: {done / 1e9:.2f}/{expected / 1e9:.2f} GB ({100 * done / expected:.0f}%)", flush=True)
+                        last = now
+
             try:
-                with session.get(SOURCE_URL, headers=headers, stream=True, timeout=(30, 90)) as response:
-                    response.raise_for_status()
-                    if offset and (response.status_code != 206 or not response.headers.get("Content-Range", "").startswith(f"bytes {offset}-")):
-                        raise RuntimeError("Serwer nie obsługuje wznawiania pobierania (Range).")
-                    done = offset
-                    last = time.monotonic()
-                    with partial.open("ab" if offset else "wb") as target:
-                        for chunk in response.iter_content(2 * 1024 * 1024):
-                            target.write(chunk)
-                            done += len(chunk)
-                            if time.monotonic() - last > 10:
-                                print(f"Pobieranie: {done / 1e9:.2f}/{expected / 1e9:.2f} GB ({100 * done / expected:.0f}%)", flush=True)
-                                last = time.monotonic()
-                if partial.stat().st_size != expected:
-                    raise requests.ConnectionError("Niepełne archiwum")
-                break
-            except requests.RequestException as exc:
-                if attempt == 6:
-                    raise
-                print(f"Błąd połączenia ({type(exc).__name__}), ponawianie...", flush=True)
-                time.sleep(min(attempt * 2, 10))
+                with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+                    futures = [
+                        pool.submit(_download_range, SOURCE_URL, etag, partial, start, end, on_chunk)
+                        for start, end in ranges
+                    ]
+                    for future in as_completed(futures):
+                        future.result()
+            except Exception:
+                partial.unlink(missing_ok=True)
+                raise
+        else:
+            for attempt in range(1, 7):
+                offset = partial.stat().st_size if partial.exists() else 0
+                if offset == expected:
+                    break
+                if offset > expected:
+                    raise RuntimeError("Plik .part jest większy niż archiwum docelowe.")
+                headers = {"Range": f"bytes={offset}-", "If-Range": etag} if offset else {}
+                try:
+                    with session.get(SOURCE_URL, headers=headers, stream=True, timeout=(30, 90)) as response:
+                        response.raise_for_status()
+                        if offset and (response.status_code != 206 or not response.headers.get("Content-Range", "").startswith(f"bytes {offset}-")):
+                            raise RuntimeError("Serwer nie obsługuje wznawiania pobierania (Range).")
+                        done = offset
+                        last = time.monotonic()
+                        with partial.open("ab" if offset else "wb") as target:
+                            for chunk in response.iter_content(2 * 1024 * 1024):
+                                target.write(chunk)
+                                done += len(chunk)
+                                if time.monotonic() - last > 10:
+                                    print(f"Pobieranie: {done / 1e9:.2f}/{expected / 1e9:.2f} GB ({100 * done / expected:.0f}%)", flush=True)
+                                    last = time.monotonic()
+                    if partial.stat().st_size != expected:
+                        raise requests.ConnectionError("Niepełne archiwum")
+                    break
+                except requests.RequestException as exc:
+                    if attempt == 6:
+                        raise
+                    print(f"Błąd połączenia ({type(exc).__name__}), ponawianie...", flush=True)
+                    time.sleep(min(attempt * 2, 10))
         partial.replace(ARCHIVE)
         with ARCHIVE.open("rb") as source:
             digest = hashlib.file_digest(source, "sha256").hexdigest()

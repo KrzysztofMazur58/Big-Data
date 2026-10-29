@@ -2,6 +2,7 @@ from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 import csv
 from datetime import datetime, timezone
+import itertools
 import time
 from pymongo.errors import BulkWriteError
 from .cleaning import POLICY_VERSION, REQUIRED_COLUMNS, clean_row
@@ -21,7 +22,7 @@ def insert_batch(collection, documents):
         return details["nInserted"], len(details.get("writeErrors", []))
 
 
-def import_files(db, limit=None, csv_dir=CSV_DIR, batch_size=5000, mode="full"):
+def import_files(db, limit=None, csv_dir=CSV_DIR, batch_size=15000, mode="full"):
     from .locking import database_lock
     with database_lock(db):
         return _import_files(db, limit, csv_dir, batch_size, mode)
@@ -108,13 +109,13 @@ def _import_files(db, limit, csv_dir, batch_size, mode):
         def flush(documents, complete=False):
             future = pool.submit(insert_batch, db.trips, documents)
             pending_writes.append((future, dict(counts), position, complete))
-            if len(pending_writes) >= 3:
+            if len(pending_writes) >= 6:
                 commit_oldest()
 
-        with ThreadPoolExecutor(max_workers=3) as pool, path.open(encoding="utf-8-sig", newline="") as stream:
+        with ThreadPoolExecutor(max_workers=4) as pool, path.open(encoding="utf-8-sig", newline="") as stream:
             reader = csv.DictReader(stream)
-            for _ in range(position):
-                next(reader)
+            if position:
+                next(itertools.islice(reader, position, position), None)
             documents = []
             pending = 0
             exhausted = True
